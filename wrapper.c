@@ -8,6 +8,7 @@
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <poll.h>
 
@@ -16,6 +17,7 @@
 #include <arpa/inet.h>
 
 #include <signal.h>
+#include <sys/eventfd.h>
 
 /* -------------- GLOBALS ----------------------- */
 
@@ -26,6 +28,14 @@
 #define SERVER_BACKLOG 1
 #define SERVER_PORT 5000
 
+#define SAVE_COMMAND "\nsave\n"
+#define EXIT_COMMAND "\nexit\n"
+
+enum SIGNAL_FLAGS {
+	SAVE=0x01,
+	EXIT=0x02,
+};
+
 static int master_fd, slave_fd;
 static pid_t child_pid;
 
@@ -35,6 +45,31 @@ static pid_t child_pid;
 void set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+ssize_t writeAll(int fd, char* buff, int buff_len) {
+	int written = 0;
+	while (written < buff_len) {
+		ssize_t n = write(fd, buff + written, buff_len - written);
+		
+		if (n > 0) {
+			written += n;
+		} else if (n == -1) {
+			if (errno == EINTR) continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				continue;
+			}
+		}
+
+		return -1;
+	}
+
+	return written;
+}
+
+void injectCommand(char* cmd) {
+	printf("Injecting command `%s` to the pty...", cmd);
+	writeAll(master_fd, cmd, strlen(cmd));
 }
 
 /**
@@ -92,23 +127,26 @@ static void set_raw(int fd) {
 /* -------------- INTERUPTS ----------------------- */
 
 volatile sig_atomic_t child_exited = 0;
-volatile sig_atomic_t exit_requested = 0;
-volatile sig_atomic_t save_requested = 0;
+
+int event_fd;
 
 void handle_sigchld(int sig) {
 	child_exited = 1;
 }
 
 void handle_sigterm(int sig) {
-	exit_requested = 1;
+	uint64_t val = EXIT;
+	write(event_fd, &val, sizeof(val));
 }
 
 void handle_sigint(int sig) {
-	exit_requested = 1;
+	uint64_t val = EXIT;
+	write(event_fd, &val, sizeof(val));
 }
 
 void handle_sigusr1(int sig) {
-	save_requested = 1;	
+	uint64_t val = SAVE;
+	write(event_fd, &val, sizeof(val));
 }
 
 void handle_sigusr2(int sig) {
@@ -153,85 +191,147 @@ dup2_fail:
 void manage_bridge() {
 	close(slave_fd);
 
-	// Init server
+	// Init server 
 	int server_fd = setup_server(SERVER_PORT);
+	event_fd = eventfd(0, EFD_NONBLOCK);
+	int client_fd = -1;
+	printf("Starting server on port %d\n", SERVER_PORT);
+
+
+	// set file descriptors as non-blocking
+	set_nonblocking(master_fd);
+	set_nonblocking(server_fd);
+
+
+	bool client_connected = 0;
+
+	// Set up the individual poll structures
+	struct pollfd poll_fds[4]; 
+	// reset the memory
+	memset(poll_fds, 0, sizeof(poll_fds));
+
+	// Initialize the poll structs
+	poll_fds[0] = (struct pollfd) { .fd = master_fd, .events = POLLIN };
+	poll_fds[1] = (struct pollfd) { .fd = server_fd, .events = POLLIN };
+	poll_fds[3] = (struct pollfd) { .fd = event_fd, .events = POLLIN };
 
 	while (!child_exited) {
-		printf("Listening on port %d...\n", SERVER_PORT);
-		// init client connection
-		int client_fd = accept(server_fd, NULL, NULL);
-		if (client_fd < 0) {
-			perror("accept");
-			exit(1);
+		// Initialize the client connection fd if there is a client connected else leave it null (essentially)
+		poll_fds[2].fd = client_connected ? client_fd : -1;
+		poll_fds[2].events = client_connected ? POLLIN : 0;
+
+		// Wait until one of the structs has been updated
+		int ready = poll(poll_fds, 4, POLL_TIMEOUT_MS);
+		if (ready < 0) {
+			if (errno == EINTR) continue;
+			perror("poll");
+			break;
 		}
-		set_raw(client_fd);
-		printf("Client connected.\n");
 
-		// Init buffers
-		char buf[BUFF_SIZE];
-		struct pollfd poll_fds[2];
-
-		while (1) {
-
-			poll_fds[0].fd = master_fd;
-			poll_fds[0].events = POLLIN;
-
-			poll_fds[1].fd = client_fd;
-			poll_fds[1].events = POLLIN;
-
-			int ready = poll(poll_fds, 2, POLL_TIMEOUT_MS);
-
-			if (ready == -1) {
-				if (errno == EINTR)
-					continue;
-				perror("poll");
+		// Client is trying to make a connection
+		if (poll_fds[1].revents & POLLIN) {
+			int fd = accept(server_fd, NULL, NULL);
+			if (fd < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+				perror("accept");
 				break;
 			}
 
-			// server --> client
-			if (poll_fds[0].revents & POLLIN) {
-				ssize_t n = read(poll_fds[0].fd, buf, BUFF_SIZE);
-				if (n > 0) {
-					write(poll_fds[1].fd, buf, n);
-				}
-				else if (n == 0)
-					break;
+			if (!client_connected) {
+				client_connected = true;
+				client_fd = fd;
+				set_nonblocking(client_fd);
+				printf("Client connected...");
+			} else {
+				close(fd);  // reject any additional clients that try to connect
 			}
-
-			// client --> server
-			if (poll_fds[1].revents & POLLIN) {
-				ssize_t n = read(poll_fds[1].fd, buf, BUFF_SIZE);
-				if (n > 0) {
-					for (int i = 0; i < n; i++) {
-						unsigned char c = buf[i];
-
-						if (c == 0x03) continue;  // Ctl-C
-						if (c == 0x1b) continue;  // ESC
-												  //
-						write(poll_fds[0].fd, &c, 1);
-					}	
-				}
-				else if (n == 0)
-					break;  // child exited
-			}
-
-			// check for exit
-			if (poll_fds[0].revents & (POLLHUP | POLLERR))
-				break;
 		}
 
-		printf("Client disconnected\n");
-		// clean up
-		close(client_fd);
+		// There is an event that needs handling
+		if (poll_fds[3].revents & POLLIN) {
+			uint64_t val;
+			printf("Signal recieved...\n");
+			while (read(event_fd, &val, sizeof(val)) == sizeof(val)) {
+				if (val == EXIT) {
+					printf("BEGINNING EXIT PROCESS: \n");
+
+					injectCommand(SAVE_COMMAND);
+					injectCommand(EXIT_COMMAND);
+				}
+				if (val == SAVE) {
+					printf("BEGINNING SAVE PROCESS: \n");
+
+					injectCommand(SAVE_COMMAND);
+				}
+			}
+		}
+
+		// Server has updates to send to client
+		if (poll_fds[0].revents & POLLIN && client_connected) {
+			char buff[BUFF_SIZE];
+			ssize_t n = read(master_fd, buff, BUFF_SIZE);	
+			if (n > 0) {
+				writeAll(client_fd, buff, n);
+			} else if (n == 0) {
+				client_connected = false;
+				close(client_fd);
+				continue;
+			} else {  // n < 0
+				if (errno == EAGAIN || errno == EINTR) continue;
+				break;
+			}
+		}
+
+		// Client has updates to send to server
+		if (poll_fds[2].revents & POLLIN) {
+			char buff[BUFF_SIZE];
+			ssize_t n = read(client_fd, buff, BUFF_SIZE);
+			if (n > 0) {
+				writeAll(master_fd, buff, n);
+			} else if (n == 0) {
+				client_connected = false;
+				close(client_fd);
+				continue;
+			} else {  // n < 0
+				if (errno == EINTR || errno == EAGAIN) continue;
+				break;
+			}
+		}
+
+		// Check for termination
+		for (int i = 0; i < 4; i++) {
+			if (poll_fds[i].revents & (POLLHUP | POLLERR)) {
+				if (i == 0) {  // master 
+					child_exited = 1;
+				}
+				else if (i == 2) { // client
+					close(client_fd);
+					client_connected = false;
+				}
+				printf("fd %d has failed\n", i);
+				break;
+			}
+		}
 	}
-	
-	printf("Child program no longer active. Shutting server down now...\n");
+
+
+
+	// cleanup
+	if (client_connected) 
+		close(client_fd);
+	if (!child_exited) {
+		injectCommand(SAVE_COMMAND);
+		injectCommand(EXIT_COMMAND);
+	}
+	close(event_fd);
 	close(server_fd);
 }
 
 int main() {
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, handle_sigchld);
+	signal(SIGTERM, handle_sigterm);
+	signal(SIGUSR1, handle_sigusr1);
 
 	// Open PTY
 	int pty_ret = openpty(&master_fd, &slave_fd, NULL, NULL, NULL);
